@@ -244,7 +244,11 @@ class Trainer:
                 if key in checkpoint["model_state_dict"]:
                     del checkpoint["model_state_dict"][key]
 
-            self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
+            try:
+                self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
+            except RuntimeError as exc:
+                print(f"Strict checkpoint load failed, retrying non-strict for compatibility: {exc}")
+                self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"], strict=False)
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             if self.scheduler:
                 self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -255,7 +259,11 @@ class Trainer:
                 for k, v in checkpoint["ema_model_state_dict"].items()
                 if k not in ["initted", "update", "step"]
             }
-            self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
+            try:
+                self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
+            except RuntimeError as exc:
+                print(f"Strict checkpoint load failed, retrying non-strict for compatibility: {exc}")
+                self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"], strict=False)
             update = 0
 
         del checkpoint
@@ -365,6 +373,9 @@ class Trainer:
                     text_inputs = batch["text"]
                     mel_spec = batch["mel"].permute(0, 2, 1)
                     mel_lengths = batch["mel_lengths"]
+                    accent_id = batch.get("accent_id")
+                    lang_id = batch.get("lang_id")
+                    domain_id = batch.get("domain_id")
 
                     # TODO. add duration predictor training
                     if self.duration_predictor is not None and self.accelerator.is_local_main_process:
@@ -372,7 +383,13 @@ class Trainer:
                         self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
 
                     loss, cond, pred = self.model(
-                        mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler
+                        mel_spec,
+                        text=text_inputs,
+                        lens=mel_lengths,
+                        noise_scheduler=self.noise_scheduler,
+                        accent_id=accent_id,
+                        lang_id=lang_id,
+                        domain_id=domain_id,
                     )
                     self.accelerator.backward(loss)
 
@@ -392,9 +409,13 @@ class Trainer:
                     progress_bar.set_postfix(update=str(global_update), loss=loss.item())
 
                 if self.accelerator.is_local_main_process:
-                    self.accelerator.log(
-                        {"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_update
-                    )
+                    log_payload = {"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}
+                    loss_detail = getattr(self.accelerator.unwrap_model(self.model), "last_loss_dict", None)
+                    if isinstance(loss_detail, dict):
+                        for key, value in loss_detail.items():
+                            if torch.is_tensor(value):
+                                log_payload[key] = value.item()
+                    self.accelerator.log(log_payload, step=global_update)
                 if self.logger == "tensorboard" and self.accelerator.is_main_process:
                     self.writer.add_scalar("loss", loss.item(), global_update)
                     self.writer.add_scalar("lr", self.scheduler.get_last_lr()[0], global_update)

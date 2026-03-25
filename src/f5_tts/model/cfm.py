@@ -19,6 +19,7 @@ from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from torchdiffeq import odeint
 
+from f5_tts.model.aux_heads import AccentAdversarialHead, CTCAuxHead
 from f5_tts.model.modules import MelSpec
 from f5_tts.model.utils import (
     default,
@@ -48,6 +49,20 @@ class CFM(nn.Module):
         mel_spec_kwargs: dict = dict(),
         frac_lengths_mask: tuple[float, float] = (0.7, 1.0),
         vocab_char_map: dict[str:int] | None = None,
+        use_distill: bool = False,
+        lambda_distill_out: float = 0.5,
+        lambda_distill_hidden: float = 0.25,
+        distill_hidden_layers: list[int] | None = None,
+        teacher_transformer: nn.Module | None = None,
+        use_ctc: bool = False,
+        lambda_ctc: float = 0.05,
+        ctc_on_generated_only: bool = True,
+        ctc_layer_index: int = -2,
+        use_accent_adv: bool = False,
+        lambda_adv: float = 0.01,
+        adv_num_classes: int = 0,
+        adv_pooling: str = "masked_mean",
+        adv_feature_layer: int = -1,
     ):
         super().__init__()
 
@@ -75,6 +90,41 @@ class CFM(nn.Module):
 
         # vocab map for tokenization
         self.vocab_char_map = vocab_char_map
+
+        # optional experiment flags
+        self.use_distill = use_distill
+        self.lambda_distill_out = lambda_distill_out
+        self.lambda_distill_hidden = lambda_distill_hidden
+        self.distill_hidden_layers = distill_hidden_layers or []
+        self.use_ctc = use_ctc
+        self.lambda_ctc = lambda_ctc
+        self.ctc_on_generated_only = ctc_on_generated_only
+        self.ctc_layer_index = ctc_layer_index
+        self.use_accent_adv = use_accent_adv
+        self.lambda_adv = lambda_adv
+        self.adv_feature_layer = adv_feature_layer
+
+        self.last_loss_dict = {}
+
+        self.teacher_transformer = teacher_transformer
+        if self.teacher_transformer is not None:
+            self.teacher_transformer.eval()
+            for p in self.teacher_transformer.parameters():
+                p.requires_grad = False
+
+        need_hidden = (self.use_distill and self.lambda_distill_hidden > 0) or self.use_ctc or self.use_accent_adv
+        if hasattr(self.transformer, "set_capture_hidden_for_distill"):
+            self.transformer.set_capture_hidden_for_distill(need_hidden)
+        if self.teacher_transformer is not None and hasattr(self.teacher_transformer, "set_capture_hidden_for_distill"):
+            self.teacher_transformer.set_capture_hidden_for_distill(need_hidden)
+
+        vocab_size = len(vocab_char_map) if exists(vocab_char_map) else 256
+        self.ctc_head = CTCAuxHead(self.dim, vocab_size) if self.use_ctc else None
+        self.accent_head = (
+            AccentAdversarialHead(self.dim, adv_num_classes, pooling=adv_pooling)
+            if self.use_accent_adv and adv_num_classes > 0
+            else None
+        )
 
     @property
     def device(self):
@@ -235,6 +285,9 @@ class CFM(nn.Module):
         *,
         lens: int["b"] | None = None,
         noise_scheduler: str | None = None,
+        accent_id: torch.Tensor | None = None,
+        lang_id: torch.Tensor | None = None,
+        domain_id: torch.Tensor | None = None,
     ):
         # handle raw wave
         if inp.ndim == 2:
@@ -296,7 +349,79 @@ class CFM(nn.Module):
         )
 
         # flow matching loss
-        loss = F.mse_loss(pred, flow, reduction="none")
-        loss = loss[rand_span_mask]
+        flow_loss = F.mse_loss(pred, flow, reduction="none")
+        flow_loss = flow_loss[rand_span_mask].mean()
 
-        return loss.mean(), cond, pred
+        zero = flow_loss.new_zeros(())
+        distill_out_loss = zero
+        distill_hidden_loss = zero
+        ctc_loss = zero
+        adv_loss = zero
+
+        student_hidden = getattr(self.transformer, "last_hidden_states", None)
+
+        if self.use_distill and self.teacher_transformer is not None:
+            with torch.no_grad():
+                teacher_pred = self.teacher_transformer(
+                    x=φ,
+                    cond=cond,
+                    text=text,
+                    time=time,
+                    drop_audio_cond=drop_audio_cond,
+                    drop_text=drop_text,
+                    mask=mask,
+                )
+                teacher_hidden = getattr(self.teacher_transformer, "last_hidden_states", None)
+            distill_out_loss = F.mse_loss(pred[rand_span_mask], teacher_pred[rand_span_mask])
+
+            if self.lambda_distill_hidden > 0 and self.distill_hidden_layers and student_hidden and teacher_hidden:
+                parts = []
+                for layer_idx in self.distill_hidden_layers:
+                    if -len(student_hidden) <= layer_idx < len(student_hidden) and -len(teacher_hidden) <= layer_idx < len(
+                        teacher_hidden
+                    ):
+                        parts.append(F.mse_loss(student_hidden[layer_idx], teacher_hidden[layer_idx]))
+                if parts:
+                    distill_hidden_loss = torch.stack(parts).mean()
+
+        if self.use_ctc and self.ctc_head is not None:
+            ctc_source = pred
+            if student_hidden and -len(student_hidden) <= self.ctc_layer_index < len(student_hidden):
+                ctc_source = student_hidden[self.ctc_layer_index]
+            generated_mask = rand_span_mask if self.ctc_on_generated_only else None
+            ctc_loss = self.ctc_head(ctc_source, text, lens, generated_mask=generated_mask)
+
+        if self.use_accent_adv and self.accent_head is not None:
+            labels = accent_id
+            if labels is None:
+                labels = lang_id
+            if labels is None:
+                labels = domain_id
+
+            if labels is not None:
+                adv_source = pred
+                if student_hidden and -len(student_hidden) <= self.adv_feature_layer < len(student_hidden):
+                    adv_source = student_hidden[self.adv_feature_layer]
+                valid = labels >= 0
+                if valid.any():
+                    logits = self.accent_head(adv_source, lambda_adv=1.0, mask=mask)
+                    adv_loss = F.cross_entropy(logits, labels.long(), ignore_index=-1)
+
+        total_loss = (
+            flow_loss
+            + self.lambda_distill_out * distill_out_loss
+            + self.lambda_distill_hidden * distill_hidden_loss
+            + self.lambda_ctc * ctc_loss
+            + self.lambda_adv * adv_loss
+        )
+
+        self.last_loss_dict = {
+            "loss_total": total_loss.detach(),
+            "loss_flow": flow_loss.detach(),
+            "loss_distill_out": distill_out_loss.detach(),
+            "loss_distill_hidden": distill_hidden_loss.detach(),
+            "loss_ctc": ctc_loss.detach(),
+            "loss_adv": adv_loss.detach(),
+        }
+
+        return total_loss, cond, pred

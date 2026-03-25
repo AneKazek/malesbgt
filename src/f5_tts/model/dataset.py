@@ -14,6 +14,19 @@ from f5_tts.model.modules import MelSpec
 from f5_tts.model.utils import default
 
 
+def _maybe_to_int(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class HFDataset(Dataset):
     def __init__(
         self,
@@ -76,6 +89,9 @@ class HFDataset(Dataset):
         return dict(
             mel_spec=mel_spec,
             text=text,
+            accent_id=_maybe_to_int(row.get("accent_id")),
+            lang_id=_maybe_to_int(row.get("lang_id")),
+            domain_id=_maybe_to_int(row.get("domain_id")),
         )
 
 
@@ -159,6 +175,9 @@ class CustomDataset(Dataset):
         return {
             "mel_spec": mel_spec,
             "text": text,
+            "accent_id": _maybe_to_int(row.get("accent_id")),
+            "lang_id": _maybe_to_int(row.get("lang_id")),
+            "domain_id": _maybe_to_int(row.get("domain_id")),
         }
 
 
@@ -322,9 +341,22 @@ def collate_fn(batch):
     text = [item["text"] for item in batch]
     text_lengths = torch.LongTensor([len(item) for item in text])
 
+    def collate_optional_label(key):
+        values = [item.get(key) for item in batch]
+        if all(v is None for v in values):
+            return None
+        return torch.LongTensor([-1 if v is None else int(v) for v in values])
+
+    accent_id = collate_optional_label("accent_id")
+    lang_id = collate_optional_label("lang_id")
+    domain_id = collate_optional_label("domain_id")
+
     return dict(
         mel=mel_specs,
         mel_lengths=mel_lengths,  # records for padding mask
         text=text,
         text_lengths=text_lengths,
+        accent_id=accent_id,
+        lang_id=lang_id,
+        domain_id=domain_id,
     )

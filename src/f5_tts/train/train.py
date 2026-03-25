@@ -18,6 +18,7 @@ os.chdir(str(files("f5_tts").joinpath("../..")))  # change working directory to 
 def main(model_cfg):
     model_cls = hydra.utils.get_class(f"f5_tts.model.{model_cfg.model.backbone}")
     model_arc = model_cfg.model.arch
+    cfm_experiment = model_cfg.model.get("cfm_experiment", {})
     tokenizer = model_cfg.model.tokenizer
     mel_spec_type = model_cfg.model.mel_spec.mel_spec_type
 
@@ -40,6 +41,7 @@ def main(model_cfg):
         transformer=model_cls(**model_arc, text_num_embeds=vocab_size, mel_dim=model_cfg.model.mel_spec.n_mel_channels),
         mel_spec_kwargs=model_cfg.model.mel_spec,
         vocab_char_map=vocab_char_map,
+        **cfm_experiment,
     )
 
     # init trainer
