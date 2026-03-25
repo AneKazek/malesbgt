@@ -6,6 +6,7 @@ data/
 ckpts/
 wandb/
 results/
+.venv_new/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
