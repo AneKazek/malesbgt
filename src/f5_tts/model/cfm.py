@@ -104,7 +104,14 @@ class CFM(nn.Module):
         self.lambda_adv = lambda_adv
         self.adv_feature_layer = adv_feature_layer
 
-        self.last_loss_dict = {}
+        self.last_loss_dict = {
+            "loss_total": torch.tensor(0.0),
+            "loss_flow": torch.tensor(0.0),
+            "loss_distill_out": torch.tensor(0.0),
+            "loss_distill_hidden": torch.tensor(0.0),
+            "loss_ctc": torch.tensor(0.0),
+            "loss_adv": torch.tensor(0.0),
+        }
 
         self.teacher_transformer = teacher_transformer
         if self.teacher_transformer is not None:
@@ -360,7 +367,11 @@ class CFM(nn.Module):
 
         student_hidden = getattr(self.transformer, "last_hidden_states", None)
 
-        if self.use_distill and self.teacher_transformer is not None:
+        if (
+            self.use_distill
+            and (self.lambda_distill_out > 0 or self.lambda_distill_hidden > 0)
+            and self.teacher_transformer is not None
+        ):
             with torch.no_grad():
                 teacher_pred = self.teacher_transformer(
                     x=φ,
@@ -372,7 +383,8 @@ class CFM(nn.Module):
                     mask=mask,
                 )
                 teacher_hidden = getattr(self.teacher_transformer, "last_hidden_states", None)
-            distill_out_loss = F.mse_loss(pred[rand_span_mask], teacher_pred[rand_span_mask])
+            if self.lambda_distill_out > 0:
+                distill_out_loss = F.mse_loss(pred[rand_span_mask], teacher_pred[rand_span_mask])
 
             if self.lambda_distill_hidden > 0 and self.distill_hidden_layers and student_hidden and teacher_hidden:
                 parts = []
@@ -384,14 +396,15 @@ class CFM(nn.Module):
                 if parts:
                     distill_hidden_loss = torch.stack(parts).mean()
 
-        if self.use_ctc and self.ctc_head is not None:
-            ctc_source = pred
+        if self.use_ctc and self.lambda_ctc > 0 and self.ctc_head is not None:
+            ctc_source = None
             if student_hidden and -len(student_hidden) <= self.ctc_layer_index < len(student_hidden):
                 ctc_source = student_hidden[self.ctc_layer_index]
-            generated_mask = rand_span_mask if self.ctc_on_generated_only else None
-            ctc_loss = self.ctc_head(ctc_source, text, lens, generated_mask=generated_mask)
+            if ctc_source is not None and ctc_source.shape[-1] == self.dim:
+                generated_mask = rand_span_mask if self.ctc_on_generated_only else None
+                ctc_loss = self.ctc_head(ctc_source, text, lens, generated_mask=generated_mask)
 
-        if self.use_accent_adv and self.accent_head is not None:
+        if self.use_accent_adv and self.lambda_adv > 0 and self.accent_head is not None:
             labels = accent_id
             if labels is None:
                 labels = lang_id
@@ -399,11 +412,11 @@ class CFM(nn.Module):
                 labels = domain_id
 
             if labels is not None:
-                adv_source = pred
+                adv_source = None
                 if student_hidden and -len(student_hidden) <= self.adv_feature_layer < len(student_hidden):
                     adv_source = student_hidden[self.adv_feature_layer]
                 valid = labels >= 0
-                if valid.any():
+                if adv_source is not None and adv_source.shape[-1] == self.dim and valid.any():
                     logits = self.accent_head(adv_source, lambda_adv=1.0, mask=mask)
                     adv_loss = F.cross_entropy(logits, labels.long(), ignore_index=-1)
 
@@ -414,6 +427,13 @@ class CFM(nn.Module):
             + self.lambda_ctc * ctc_loss
             + self.lambda_adv * adv_loss
         )
+
+        if not torch.isfinite(total_loss):
+            total_loss = flow_loss
+            distill_out_loss = zero
+            distill_hidden_loss = zero
+            ctc_loss = zero
+            adv_loss = zero
 
         self.last_loss_dict = {
             "loss_total": total_loss.detach(),

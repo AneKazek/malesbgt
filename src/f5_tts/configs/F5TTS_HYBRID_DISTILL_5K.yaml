@@ -4,21 +4,21 @@ hydra:
 
 datasets:
   name: Emilia_ZH_EN
-  batch_size_per_gpu: 38400
+  batch_size_per_gpu: 19200
   batch_size_type: frame
-  max_samples: 64
+  max_samples: 32
   num_workers: 16
 
 optim:
-  epochs: 11
-  learning_rate: 7.5e-5
-  num_warmup_updates: 20000
+  epochs: 1
+  learning_rate: 2.0e-5
+  num_warmup_updates: 500
   grad_accumulation_steps: 1
   max_grad_norm: 1.0
   bnb_optimizer: False
 
 model:
-  name: F5TTS_MambaBaselineCompat
+  name: F5TTS_HYBRID_DISTILL_5K
   tokenizer: pinyin
   tokenizer_path: null
   backbone: HybridDiT
@@ -34,15 +34,15 @@ model:
     attn_backend: torch
     attn_mask_enabled: False
     checkpoint_activations: False
-    use_mamba: false
-    mamba_layers: []
+    use_mamba: true
+    mamba_layers: [10, 11]
     mamba_d_state: 16
     mamba_d_conv: 4
     mamba_expand: 2
     capture_hidden_for_distill: false
   cfm_experiment:
-    use_distill: false
-    lambda_distill_out: 0.0
+    use_distill: true
+    lambda_distill_out: 0.05
     lambda_distill_hidden: 0.0
     distill_hidden_layers: []
     use_ctc: false
@@ -71,7 +71,7 @@ ckpts:
   wandb_run_name: ${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}
   wandb_resume_id: null
   log_samples: True
-  save_per_updates: 50000
-  keep_last_n_checkpoints: -1
-  last_per_updates: 5000
+  save_per_updates: 500
+  keep_last_n_checkpoints: 10
+  last_per_updates: 200
   save_dir: ckpts/${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}

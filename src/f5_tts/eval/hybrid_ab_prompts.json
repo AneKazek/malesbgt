@@ -1,0 +1,19 @@
+{
+  "short": [
+    "Please start now.",
+    "The train is on time.",
+    "Open the door."
+  ],
+  "medium": [
+    "We tested the model twice, and both runs produced clear speech with stable pacing.",
+    "After lunch, the engineer reviewed logs, fixed one config typo, and restarted training.",
+    "If you hear clipping at the end, reduce the speed slightly and regenerate the sample."
+  ],
+  "long": [
+    "Today we run a controlled comparison between baseline and hybrid checkpoints. Keep all settings fixed, including prompt audio, generation steps, and text normalization, then inspect whether pronunciation, rhythm, and sentence completeness remain stable across all utterances.",
+    "Before enabling any auxiliary objective, confirm that the flow loss continues to decrease, no empty outputs are produced, and no repeated phrase dominates the generated speech. If any of these symptoms appears, stop and rollback to the previous stable checkpoint."
+  ],
+  "tricky": [
+    "Status update: build v2.1.7 passed all checks, but latency rose by 12.5%; jadi tolong cek lagi punctuation, numbers, and code-switch words."
+  ]
+}

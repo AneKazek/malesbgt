@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader, Dataset, SequentialSampler
 from tqdm import tqdm
 
 from f5_tts.model import CFM
+from f5_tts.model.checkpoint_audit import format_checkpoint_audit, summarize_checkpoint_load
 from f5_tts.model.dataset import DynamicBatchSampler, collate_fn
 from f5_tts.model.utils import default, exists
 
@@ -142,10 +143,45 @@ class Trainer:
         else:
             self.optimizer = AdamW(model.parameters(), lr=learning_rate, fused=True)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+        self.ckpt_audit_summary = None
+        self._startup_summary_printed = False
 
     @property
     def is_main(self):
         return self.accelerator.is_main_process
+
+    def _print_startup_config_summary(self):
+        if self._startup_summary_printed or not self.is_main:
+            return
+
+        model = self.accelerator.unwrap_model(self.model)
+        transformer = getattr(model, "transformer", None)
+
+        use_mamba = bool(getattr(transformer, "use_mamba", False))
+        mamba_layers = getattr(transformer, "mamba_layers", []) or []
+
+        cfg_msg = (
+            "[Training Config Summary] "
+            f"epochs={self.epochs} lr={self.optimizer.param_groups[0]['lr']} warmup_updates={self.num_warmup_updates} "
+            f"batch_size_per_gpu={self.batch_size_per_gpu} batch_size_type={self.batch_size_type} max_samples={self.max_samples} "
+            f"grad_accumulation_steps={self.grad_accumulation_steps} max_grad_norm={self.max_grad_norm}"
+        )
+        exp_msg = (
+            "[CFM Experimental Summary] "
+            f"backbone={transformer.__class__.__name__ if transformer is not None else 'unknown'} "
+            f"use_mamba={use_mamba} mamba_layers={list(mamba_layers)} "
+            f"use_distill={bool(getattr(model, 'use_distill', False))} "
+            f"lambda_distill_out={float(getattr(model, 'lambda_distill_out', 0.0)):.6f} "
+            f"lambda_distill_hidden={float(getattr(model, 'lambda_distill_hidden', 0.0)):.6f} "
+            f"use_ctc={bool(getattr(model, 'use_ctc', False))} "
+            f"lambda_ctc={float(getattr(model, 'lambda_ctc', 0.0)):.6f} "
+            f"use_accent_adv={bool(getattr(model, 'use_accent_adv', False))} "
+            f"lambda_adv={float(getattr(model, 'lambda_adv', 0.0)):.6f}"
+        )
+
+        print(cfg_msg)
+        print(exp_msg)
+        self._startup_summary_printed = True
 
     def save_checkpoint(self, update, last=False):
         self.accelerator.wait_for_everyone()
@@ -266,11 +302,29 @@ class Trainer:
                 self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"], strict=False)
             update = 0
 
+        model_for_audit = self.accelerator.unwrap_model(self.model)
+        self.ckpt_audit_summary = summarize_checkpoint_load(model_for_audit, checkpoint["model_state_dict"])
+        if self.is_main:
+            print(format_checkpoint_audit(self.ckpt_audit_summary))
+            if self.accelerator.is_local_main_process:
+                self.accelerator.log(
+                    {
+                        "ckpt_load_ratio_percent": float(self.ckpt_audit_summary["load_ratio_percent"]),
+                        "ckpt_missing_keys": len(self.ckpt_audit_summary["missing_keys"]),
+                        "ckpt_unexpected_keys": len(self.ckpt_audit_summary["unexpected_keys"]),
+                        "ckpt_missing_suspicious": len(self.ckpt_audit_summary["suspicious_missing_keys"]),
+                        "ckpt_unexpected_suspicious": len(self.ckpt_audit_summary["suspicious_unexpected_keys"]),
+                    },
+                    step=update,
+                )
+
         del checkpoint
         gc.collect()
         return update
 
     def train(self, train_dataset: Dataset, num_workers=16, resumable_with_seed: int = None):
+        self._print_startup_config_summary()
+
         if self.log_samples:
             from f5_tts.infer.utils_infer import cfg_strength, load_vocoder, nfe_step, sway_sampling_coef
 
@@ -369,6 +423,7 @@ class Trainer:
             )
 
             for batch in current_dataloader:
+                grad_norm_value = None
                 with self.accelerator.accumulate(self.model):
                     text_inputs = batch["text"]
                     mel_spec = batch["mel"].permute(0, 2, 1)
@@ -394,7 +449,12 @@ class Trainer:
                     self.accelerator.backward(loss)
 
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        if grad_norm is not None:
+                            if torch.is_tensor(grad_norm):
+                                grad_norm_value = grad_norm.detach().float().item()
+                            else:
+                                grad_norm_value = float(grad_norm)
 
                     self.optimizer.step()
                     self.scheduler.step()
@@ -415,6 +475,8 @@ class Trainer:
                         for key, value in loss_detail.items():
                             if torch.is_tensor(value):
                                 log_payload[key] = value.item()
+                    if grad_norm_value is not None:
+                        log_payload["grad_norm"] = grad_norm_value
                     self.accelerator.log(log_payload, step=global_update)
                 if self.logger == "tensorboard" and self.accelerator.is_main_process:
                     self.writer.add_scalar("loss", loss.item(), global_update)

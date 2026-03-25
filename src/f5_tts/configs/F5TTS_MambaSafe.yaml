@@ -42,15 +42,15 @@ model:
     capture_hidden_for_distill: true
   cfm_experiment:
     use_distill: false
-    lambda_distill_out: 0.5
-    lambda_distill_hidden: 0.25
+    lambda_distill_out: 0.0
+    lambda_distill_hidden: 0.0
     distill_hidden_layers: []
     use_ctc: false
-    lambda_ctc: 0.05
+    lambda_ctc: 0.0
     ctc_on_generated_only: true
     ctc_layer_index: -2
     use_accent_adv: false
-    lambda_adv: 0.01
+    lambda_adv: 0.0
     adv_num_classes: 0
     adv_pooling: masked_mean
     adv_feature_layer: -1
