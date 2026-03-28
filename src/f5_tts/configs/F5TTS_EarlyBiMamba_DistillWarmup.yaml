@@ -1,0 +1,104 @@
+# ============================================================
+#  F5TTS_EarlyBiMamba_DistillWarmup  —  INITIAL FINETUNE
+# ============================================================
+#
+#  Use this config for the FIRST 5k–10k update steps when loading
+#  a pretrained F5-TTS DiT checkpoint into HybridDiT.
+#
+#  The Mamba SSM weights are randomly initialised; distillation loss
+#  forces the early-layer Mamba representations to approximate what
+#  the original DiT layers produced, giving a stable starting point
+#  before full training takes over.
+#
+#  Workflow:
+#    1. Train with this config for 5k–10k steps (distill warmup)
+#    2. Switch to F5TTS_EarlyBiMamba_v1.yaml for full training
+#       (set use_distill: false, restore original LR schedule)
+#
+#  lambda_distill_out = 0.1 means:
+#    total_loss = flow_matching_loss + 0.1 * MSE(student_out, teacher_out)
+# ============================================================
+
+hydra:
+  run:
+    dir: ckpts/${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+datasets:
+  name: Emilia_ZH_EN
+  batch_size_per_gpu: 19200          # smaller batch for distill stability
+  batch_size_type: frame
+  max_samples: 32
+  num_workers: 16
+
+optim:
+  epochs: 1                          # short warmup run
+  learning_rate: 2.0e-5              # lower LR for stabilisation
+  num_warmup_updates: 500
+  grad_accumulation_steps: 1
+  max_grad_norm: 1.0
+  bnb_optimizer: False
+
+model:
+  name: F5TTS_EarlyBiMamba_DistillWarmup
+  tokenizer: pinyin
+  tokenizer_path: null
+  backbone: HybridDiT
+  arch:
+    dim: 1024
+    depth: 22
+    heads: 16
+    ff_mult: 2
+    text_dim: 512
+    text_mask_padding: False
+    conv_layers: 4
+    pe_attn_head: 1
+    attn_backend: torch
+    attn_mask_enabled: False
+    checkpoint_activations: False
+
+    use_mamba: true
+    mamba_layers: [0, 1, 2, 3, 4, 5, 6, 7]
+    use_bidi: true
+    inject_sinpos: true
+    mamba_d_state: 64
+    mamba_d_conv: 4
+    mamba_expand: 2
+    capture_hidden_for_distill: true   # MUST be true for distill
+
+  cfm_experiment:
+    use_distill: true
+    lambda_distill_out: 0.1            # output-level distillation
+    lambda_distill_hidden: 0.0         # set to 0.01 if VRAM allows
+    distill_hidden_layers: []          # e.g. [8, 12, 16] for layer distill
+    use_ctc: false
+    lambda_ctc: 0.0
+    ctc_on_generated_only: true
+    ctc_layer_index: -2
+    use_accent_adv: false
+    lambda_adv: 0.0
+    adv_num_classes: 0
+    adv_pooling: masked_mean
+    adv_feature_layer: -1
+
+  mel_spec:
+    target_sample_rate: 24000
+    n_mel_channels: 100
+    hop_length: 256
+    win_length: 1024
+    n_fft: 1024
+    mel_spec_type: vocos
+
+  vocoder:
+    is_local: False
+    local_path: null
+
+ckpts:
+  logger: wandb
+  wandb_project: CFM-TTS
+  wandb_run_name: ${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}
+  wandb_resume_id: null
+  log_samples: True
+  save_per_updates: 500
+  keep_last_n_checkpoints: 5
+  last_per_updates: 200
+  save_dir: ckpts/${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}
