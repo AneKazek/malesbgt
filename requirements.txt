@@ -1,3 +1,9 @@
+- NOTE: This file is a broad pinned snapshot and may be heavy for Kaggle.
+- Prefer profile files for reproducible installs:
+-   - requirements-torch28-cu12-localmatch.txt (Torch 2.8 + cu128, Python 3.11)
+-   - requirements-py311-torch260-cu124.txt (Torch 2.6 + cu124, Python 3.11)
+-   - requirements-kaggle-torch210.txt (Torch 2.10 fallback profile)
+
 accelerate==1.13.0
 aiofiles==24.1.0
 aiohappyeyeballs==2.6.1
@@ -36,7 +42,7 @@ einops==0.8.2
 einx==0.4.2
 ema-pytorch==0.7.9
 encodec==0.1.1
--e file:///home/anekazek/anything-notsupported-inwindows/kcv-tts
+-e .
 fastapi==0.135.2
 faster-whisper==1.2.1
 ffmpy==1.0.0
