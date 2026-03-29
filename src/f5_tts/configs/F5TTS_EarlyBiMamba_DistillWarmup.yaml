@@ -67,6 +67,8 @@ model:
 
   cfm_experiment:
     use_distill: true
+    teacher_backbone: DiT
+    teacher_ckpt_path: null
     lambda_distill_out: 0.1            # output-level distillation
     lambda_distill_hidden: 0.0         # set to 0.01 if VRAM allows
     distill_hidden_layers: []          # e.g. [8, 12, 16] for layer distill

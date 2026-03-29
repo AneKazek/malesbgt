@@ -42,6 +42,8 @@ model:
     capture_hidden_for_distill: false
   cfm_experiment:
     use_distill: true
+    teacher_backbone: DiT
+    teacher_ckpt_path: null
     lambda_distill_out: 0.05
     lambda_distill_hidden: 0.0
     distill_hidden_layers: []
