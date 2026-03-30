@@ -264,8 +264,14 @@ class Trainer:
             if key in checkpoint["ema_model_state_dict"]:
                 del checkpoint["ema_model_state_dict"][key]
 
+        ema_loaded_strict = True
         if self.is_main:
-            self.ema_model.load_state_dict(checkpoint["ema_model_state_dict"])
+            try:
+                self.ema_model.load_state_dict(checkpoint["ema_model_state_dict"])
+            except RuntimeError as exc:
+                ema_loaded_strict = False
+                print(f"Strict EMA checkpoint load failed, retrying non-strict for compatibility: {exc}")
+                self.ema_model.load_state_dict(checkpoint["ema_model_state_dict"], strict=False)
 
         if "update" in checkpoint or "step" in checkpoint:
             # patch for backward compatibility, with before f992c4e
@@ -280,15 +286,37 @@ class Trainer:
                 if key in checkpoint["model_state_dict"]:
                     del checkpoint["model_state_dict"][key]
 
+            model_loaded_strict = True
             try:
                 self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
             except RuntimeError as exc:
+                model_loaded_strict = False
                 print(f"Strict checkpoint load failed, retrying non-strict for compatibility: {exc}")
                 self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"], strict=False)
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+            optimizer_loaded = True
+            try:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            except Exception as exc:
+                optimizer_loaded = False
+                print(f"Optimizer checkpoint load failed, using fresh optimizer state: {exc}")
+
+            scheduler_loaded = True
             if self.scheduler:
-                self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            update = checkpoint["update"]
+                try:
+                    self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                except Exception as exc:
+                    scheduler_loaded = False
+                    print(f"Scheduler checkpoint load failed, using fresh scheduler state: {exc}")
+
+            if model_loaded_strict and optimizer_loaded and scheduler_loaded and ema_loaded_strict:
+                update = checkpoint["update"]
+            else:
+                update = 0
+                print(
+                    "Checkpoint loaded in compatibility mode; update reset to 0 "
+                    "to avoid resuming with incompatible optimizer/scheduler state."
+                )
         else:
             checkpoint["model_state_dict"] = {
                 k.replace("ema_model.", ""): v
