@@ -54,6 +54,7 @@ class CFM(nn.Module):
         lambda_distill_hidden: float = 0.25,
         distill_hidden_layers: list[int] | None = None,
         teacher_transformer: nn.Module | None = None,
+        distill_temperature: float = 4.0,
         use_ctc: bool = False,
         lambda_ctc: float = 0.05,
         ctc_on_generated_only: bool = True,
@@ -96,6 +97,7 @@ class CFM(nn.Module):
         self.lambda_distill_out = lambda_distill_out
         self.lambda_distill_hidden = lambda_distill_hidden
         self.distill_hidden_layers = distill_hidden_layers or []
+        self.distill_temperature = distill_temperature
         self.use_ctc = use_ctc
         self.lambda_ctc = lambda_ctc
         self.ctc_on_generated_only = ctc_on_generated_only
@@ -384,7 +386,12 @@ class CFM(nn.Module):
                 )
                 teacher_hidden = getattr(self.teacher_transformer, "last_hidden_states", None)
             if self.lambda_distill_out > 0:
-                distill_out_loss = F.mse_loss(pred[rand_span_mask], teacher_pred[rand_span_mask])
+                T = self.distill_temperature
+                pred_m = pred[rand_span_mask]              # [N, mel_bins]
+                teacher_m = teacher_pred[rand_span_mask]   # [N, mel_bins]
+                s_log = F.log_softmax(pred_m / T, dim=-1)
+                t_sft = F.softmax(teacher_m.detach() / T, dim=-1)
+                distill_out_loss = F.kl_div(s_log, t_sft, reduction="batchmean") * (T**2)
 
             if self.lambda_distill_hidden > 0 and self.distill_hidden_layers and student_hidden and teacher_hidden:
                 parts = []

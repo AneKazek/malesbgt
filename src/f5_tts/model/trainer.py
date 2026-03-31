@@ -173,6 +173,7 @@ class Trainer:
             f"use_distill={bool(getattr(model, 'use_distill', False))} "
             f"lambda_distill_out={float(getattr(model, 'lambda_distill_out', 0.0)):.6f} "
             f"lambda_distill_hidden={float(getattr(model, 'lambda_distill_hidden', 0.0)):.6f} "
+            f"distill_temperature={float(getattr(model, 'distill_temperature', 1.0)):.1f} "
             f"use_ctc={bool(getattr(model, 'use_ctc', False))} "
             f"lambda_ctc={float(getattr(model, 'lambda_ctc', 0.0)):.6f} "
             f"use_accent_adv={bool(getattr(model, 'use_accent_adv', False))} "

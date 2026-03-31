@@ -44,8 +44,9 @@ model:
     use_distill: true
     teacher_backbone: DiT
     teacher_ckpt_path: null
-    lambda_distill_out: 0.05
+    lambda_distill_out: 0.1      # raised from 0.05; KL scale differs from MSE
     lambda_distill_hidden: 0.0
+    distill_temperature: 4.0     # Hinton 2015: soft targets via temperature softmax
     distill_hidden_layers: []
     use_ctc: false
     lambda_ctc: 0.0
