@@ -83,6 +83,7 @@ model:
     # Set use_distill: true + lambda_distill_out: 0.1 for first 5k steps,
     # then switch to false for full training.
     use_distill: false
+    freeze_student_except_mamba_mixers: false
     lambda_distill_out: 0.0
     lambda_distill_hidden: 0.0
     distill_hidden_layers: []

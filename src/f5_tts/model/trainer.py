@@ -136,12 +136,24 @@ class Trainer:
 
         self.duration_predictor = duration_predictor
 
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        if not trainable_params:
+            raise ValueError(
+                "No trainable parameters found for optimizer initialization. "
+                "Check freeze policy or model configuration."
+            )
+
+        self.trainable_param_count = sum(p.numel() for p in trainable_params)
+        self.total_param_count = sum(p.numel() for p in model.parameters())
+        if self.is_main:
+            print(f"Trainable params: {self.trainable_param_count}/{self.total_param_count}")
+
         if bnb_optimizer:
             import bitsandbytes as bnb
 
-            self.optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
+            self.optimizer = bnb.optim.AdamW8bit(trainable_params, lr=learning_rate)
         else:
-            self.optimizer = AdamW(model.parameters(), lr=learning_rate, fused=True)
+            self.optimizer = AdamW(trainable_params, lr=learning_rate, fused=True)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         self.ckpt_audit_summary = None
         self._startup_summary_printed = False

@@ -111,11 +111,57 @@ def _load_teacher_transformer(teacher_transformer, checkpoint_path: str):
     }
 
 
+def _freeze_student_except_mamba_mixers(model: CFM):
+    """Freeze all student params, then unfreeze mixer params on configured mamba layers."""
+    transformer = getattr(model, "transformer", None)
+    if transformer is None or not hasattr(transformer, "transformer_blocks"):
+        raise ValueError(
+            "freeze_student_except_mamba_mixers requires a transformer backbone with transformer_blocks."
+        )
+
+    mamba_layers = list(getattr(transformer, "mamba_layers", []) or [])
+    if not mamba_layers:
+        raise ValueError(
+            "freeze_student_except_mamba_mixers=true but no mamba_layers are configured on the student model."
+        )
+
+    for param in model.parameters():
+        param.requires_grad = False
+
+    depth = len(transformer.transformer_blocks)
+    enabled_layers = []
+    for idx in mamba_layers:
+        if idx < 0 or idx >= depth:
+            continue
+        block = transformer.transformer_blocks[idx]
+        mixer = getattr(block, "mixer", None)
+        if mixer is None:
+            continue
+        for param in mixer.parameters():
+            param.requires_grad = True
+        enabled_layers.append(idx)
+
+    trainable = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    total = sum(param.numel() for param in model.parameters())
+    if trainable == 0:
+        raise RuntimeError(
+            "freeze_student_except_mamba_mixers left zero trainable params. "
+            "Check mamba_layers and backbone configuration."
+        )
+
+    return {
+        "trainable": trainable,
+        "total": total,
+        "enabled_layers": enabled_layers,
+    }
+
+
 @hydra.main(version_base="1.3", config_path=str(files("f5_tts").joinpath("configs")), config_name=None)
 def main(model_cfg):
     model_cls = hydra.utils.get_class(f"f5_tts.model.{model_cfg.model.backbone}")
     model_arc = _to_plain_dict(model_cfg.model.arch)
     cfm_experiment = _to_plain_dict(model_cfg.model.get("cfm_experiment", {}))
+    freeze_student_except_mamba_mixers = bool(cfm_experiment.pop("freeze_student_except_mamba_mixers", False))
     tokenizer = model_cfg.model.tokenizer
     mel_spec_cfg = _to_plain_dict(model_cfg.model.mel_spec)
     mel_spec_type = mel_spec_cfg["mel_spec_type"]
@@ -183,6 +229,19 @@ def main(model_cfg):
         vocab_char_map=vocab_char_map,
         **cfm_experiment,
     )
+
+    if freeze_student_except_mamba_mixers:
+        if not use_distill:
+            print(
+                "[Freeze Policy] freeze_student_except_mamba_mixers=true but use_distill=false; policy is ignored."
+            )
+        else:
+            freeze_stats = _freeze_student_except_mamba_mixers(model)
+            print(
+                "[Freeze Policy] student frozen except mamba mixers "
+                f"(layers={freeze_stats['enabled_layers']}) "
+                f"trainable={freeze_stats['trainable']}/{freeze_stats['total']}"
+            )
 
     # init trainer
     trainer = Trainer(
