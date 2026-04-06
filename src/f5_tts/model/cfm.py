@@ -386,22 +386,23 @@ class CFM(nn.Module):
                 )
                 teacher_hidden = getattr(self.teacher_transformer, "last_hidden_states", None)
             if self.lambda_distill_out > 0:
-                T = self.distill_temperature
-                pred_m = pred[rand_span_mask]              # [N, mel_bins]
-                teacher_m = teacher_pred[rand_span_mask]   # [N, mel_bins]
-                s_log = F.log_softmax(pred_m / T, dim=-1)
-                t_sft = F.softmax(teacher_m.detach() / T, dim=-1)
-                distill_out_loss = F.kl_div(s_log, t_sft, reduction="batchmean") * (T**2)
+                pred_m = pred[rand_span_mask]
+                teacher_m = teacher_pred[rand_span_mask].detach()
+                distill_out_loss = F.smooth_l1_loss(pred_m, teacher_m, beta=0.1)
 
             if self.lambda_distill_hidden > 0 and self.distill_hidden_layers and student_hidden and teacher_hidden:
-                parts = []
-                for layer_idx in self.distill_hidden_layers:
-                    if -len(student_hidden) <= layer_idx < len(student_hidden) and -len(teacher_hidden) <= layer_idx < len(
-                        teacher_hidden
-                    ):
-                        parts.append(F.mse_loss(student_hidden[layer_idx], teacher_hidden[layer_idx]))
-                if parts:
-                    distill_hidden_loss = torch.stack(parts).mean()
+                active_mask = rand_span_mask & mask
+                if active_mask.any():
+                    parts = []
+                    for layer_idx in self.distill_hidden_layers:
+                        in_s = -len(student_hidden) <= layer_idx < len(student_hidden)
+                        in_t = -len(teacher_hidden) <= layer_idx < len(teacher_hidden)
+                        if in_s and in_t:
+                            s_h = student_hidden[layer_idx][active_mask]
+                            t_h = teacher_hidden[layer_idx][active_mask].detach()
+                            parts.append(F.smooth_l1_loss(s_h, t_h, beta=1.0))
+                    if parts:
+                        distill_hidden_loss = torch.stack(parts).mean()
 
         if self.use_ctc and self.lambda_ctc > 0 and self.ctc_head is not None:
             ctc_source = None

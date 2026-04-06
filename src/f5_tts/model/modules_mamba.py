@@ -120,25 +120,33 @@ class BidirectionalMambaSubBlock(nn.Module):
         x: torch.Tensor,          # (B, T, D)
         mask: torch.Tensor | None = None,  # (B, T) bool, True = valid
     ) -> torch.Tensor:
+        mask_expanded = mask.unsqueeze(-1) if mask is not None else None
 
-        # Positional injection before scan
+        # Zero out padding before scan so padded frames do not contaminate SSM state.
+        if mask_expanded is not None:
+            x = x.masked_fill(~mask_expanded, 0.0)
+
+        # Positional injection before scan; re-mask so padding stays silent.
         if self.inject_sinpos:
             sinpos = _sinusoidal_pos(x.shape[1], x.shape[2], x.device)
             x = x + self.pos_scale * sinpos
+            if mask_expanded is not None:
+                x = x.masked_fill(~mask_expanded, 0.0)
 
         # Forward scan
         fwd_out = self.fwd(x)                        # (B, T, D)
 
         # Backward scan: flip time → scan → flip back
-        bwd_out = self.bwd(x.flip(1)).flip(1)        # (B, T, D)
+        x_flip = x.flip(1)
+        bwd_out = self.bwd(x_flip).flip(1)           # (B, T, D)
 
         # Merge
         out = self.merge(torch.cat([fwd_out, bwd_out], dim=-1))  # (B, T, D)
         out = self.dropout(out)
 
         # Zero out padding positions to keep gradients clean
-        if mask is not None:
-            out = out.masked_fill(~mask.unsqueeze(-1), 0.0)
+        if mask_expanded is not None:
+            out = out.masked_fill(~mask_expanded, 0.0)
 
         return out
 

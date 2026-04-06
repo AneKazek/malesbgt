@@ -24,6 +24,24 @@ from f5_tts.model.utils import default, exists
 # trainer
 
 
+def _build_param_groups(model: CFM, base_lr: float) -> list[dict]:
+    mamba_params, other_params = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if any(token in name for token in (".fwd.", ".bwd.", ".merge.", ".pos_scale")):
+            mamba_params.append(param)
+        else:
+            other_params.append(param)
+
+    param_groups = []
+    if mamba_params:
+        param_groups.append({"params": mamba_params, "lr": base_lr * 3.0})
+    if other_params:
+        param_groups.append({"params": other_params, "lr": base_lr})
+    return param_groups
+
+
 class Trainer:
     def __init__(
         self,
@@ -135,6 +153,7 @@ class Trainer:
         self.noise_scheduler = noise_scheduler
 
         self.duration_predictor = duration_predictor
+        self.base_learning_rate = learning_rate
 
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         if not trainable_params:
@@ -148,12 +167,13 @@ class Trainer:
         if self.is_main:
             print(f"Trainable params: {self.trainable_param_count}/{self.total_param_count}")
 
+        optimizer_param_groups = _build_param_groups(model, learning_rate)
         if bnb_optimizer:
             import bitsandbytes as bnb
 
-            self.optimizer = bnb.optim.AdamW8bit(trainable_params, lr=learning_rate)
+            self.optimizer = bnb.optim.AdamW8bit(optimizer_param_groups)
         else:
-            self.optimizer = AdamW(trainable_params, lr=learning_rate, fused=True)
+            self.optimizer = AdamW(optimizer_param_groups, fused=True)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         self.ckpt_audit_summary = None
         self._startup_summary_printed = False
@@ -174,7 +194,8 @@ class Trainer:
 
         cfg_msg = (
             "[Training Config Summary] "
-            f"epochs={self.epochs} lr={self.optimizer.param_groups[0]['lr']} warmup_updates={self.num_warmup_updates} "
+            f"epochs={self.epochs} base_lr={self.base_learning_rate} "
+            f"lr_groups={[group['lr'] for group in self.optimizer.param_groups]} warmup_updates={self.num_warmup_updates} "
             f"batch_size_per_gpu={self.batch_size_per_gpu} batch_size_type={self.batch_size_type} max_samples={self.max_samples} "
             f"grad_accumulation_steps={self.grad_accumulation_steps} max_grad_norm={self.max_grad_norm}"
         )
@@ -433,6 +454,18 @@ class Trainer:
         start_update = self.load_checkpoint()
         global_update = start_update
 
+        cfm_model = self.accelerator.unwrap_model(self.model)
+        distill_hidden_target = float(getattr(cfm_model, "lambda_distill_hidden", 0.0))
+
+        def _update_hidden_ramp(global_update: int, total_updates: int):
+            if distill_hidden_target <= 0:
+                return
+            ramp_end = int(total_updates * 0.15)
+            if global_update >= ramp_end:
+                cfm_model.lambda_distill_hidden = distill_hidden_target
+            else:
+                cfm_model.lambda_distill_hidden = distill_hidden_target * (global_update / max(ramp_end, 1))
+
         if exists(resumable_with_seed):
             orig_epoch_step = len(train_dataloader)
             start_step = start_update * self.grad_accumulation_steps
@@ -478,6 +511,7 @@ class Trainer:
                         dur_loss = self.duration_predictor(mel_spec, lens=batch.get("durations"))
                         self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
 
+                    _update_hidden_ramp(global_update, total_updates)
                     loss, cond, pred = self.model(
                         mel_spec,
                         text=text_inputs,

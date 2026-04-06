@@ -15,8 +15,8 @@
 #    2. Switch to F5TTS_EarlyBiMamba_v1.yaml for full training
 #       (set use_distill: false, restore original LR schedule)
 #
-#  lambda_distill_out = 0.1 means:
-#    total_loss = flow_matching_loss + 0.1 * MSE(student_out, teacher_out)
+#  Hidden KD is the primary stabilizer here:
+#    total_loss = flow_matching_loss + ramp(t) * 0.02 * SmoothL1(h_student[7], h_teacher[7])
 # ============================================================
 
 hydra:
@@ -70,9 +70,9 @@ model:
     freeze_student_except_mamba_mixers: true
     teacher_backbone: DiT
     teacher_ckpt_path: null
-    lambda_distill_out: 0.1            # output-level distillation
-    lambda_distill_hidden: 0.0         # set to 0.01 if VRAM allows
-    distill_hidden_layers: []          # e.g. [8, 12, 16] for layer distill
+    lambda_distill_out: 0.0
+    lambda_distill_hidden: 0.02
+    distill_hidden_layers: [7]
     use_ctc: false
     lambda_ctc: 0.0
     ctc_on_generated_only: true
