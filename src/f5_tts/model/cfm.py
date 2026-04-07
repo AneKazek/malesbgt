@@ -53,6 +53,8 @@ class CFM(nn.Module):
         lambda_distill_out: float = 0.5,
         lambda_distill_hidden: float = 0.25,
         distill_hidden_layers: list[int] | None = None,
+        normalize_distill_hidden: bool = False,
+        distill_hidden_norm_eps: float = 1.0e-5,
         teacher_transformer: nn.Module | None = None,
         distill_temperature: float = 4.0,
         use_ctc: bool = False,
@@ -97,6 +99,8 @@ class CFM(nn.Module):
         self.lambda_distill_out = lambda_distill_out
         self.lambda_distill_hidden = lambda_distill_hidden
         self.distill_hidden_layers = distill_hidden_layers or []
+        self.normalize_distill_hidden = normalize_distill_hidden
+        self.distill_hidden_norm_eps = distill_hidden_norm_eps
         self.distill_temperature = distill_temperature
         self.use_ctc = use_ctc
         self.lambda_ctc = lambda_ctc
@@ -138,6 +142,9 @@ class CFM(nn.Module):
     @property
     def device(self):
         return next(self.parameters()).device
+
+    def _normalize_hidden_for_distill(self, hidden: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(hidden, (hidden.shape[-1],), eps=self.distill_hidden_norm_eps)
 
     @torch.no_grad()
     def sample(
@@ -400,6 +407,9 @@ class CFM(nn.Module):
                         if in_s and in_t:
                             s_h = student_hidden[layer_idx][active_mask]
                             t_h = teacher_hidden[layer_idx][active_mask].detach()
+                            if self.normalize_distill_hidden:
+                                s_h = self._normalize_hidden_for_distill(s_h)
+                                t_h = self._normalize_hidden_for_distill(t_h)
                             parts.append(F.smooth_l1_loss(s_h, t_h, beta=1.0))
                     if parts:
                         distill_hidden_loss = torch.stack(parts).mean()

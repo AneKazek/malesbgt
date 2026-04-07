@@ -24,21 +24,78 @@ from f5_tts.model.utils import default, exists
 # trainer
 
 
-def _build_param_groups(model: CFM, base_lr: float) -> list[dict]:
-    mamba_params, other_params = [], []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if any(token in name for token in (".fwd.", ".bwd.", ".merge.", ".pos_scale")):
-            mamba_params.append(param)
-        else:
-            other_params.append(param)
+def _append_param_group(param_groups: list[dict], params: list[torch.nn.Parameter], lr: float, group_name: str) -> None:
+    if params:
+        param_groups.append(
+            {
+                "params": params,
+                "lr": float(lr),
+                "group_name": group_name,
+                "param_count": int(sum(param.numel() for param in params)),
+            }
+        )
 
-    param_groups = []
-    if mamba_params:
-        param_groups.append({"params": mamba_params, "lr": base_lr * 3.0})
-    if other_params:
-        param_groups.append({"params": other_params, "lr": base_lr})
+
+def _build_param_groups(
+    model: CFM,
+    base_lr: float,
+    *,
+    mamba_learning_rate: float | None = None,
+    backbone_learning_rate: float | None = None,
+    misc_learning_rate: float | None = None,
+) -> list[dict]:
+    explicit_group_lrs = any(lr is not None for lr in (mamba_learning_rate, backbone_learning_rate, misc_learning_rate))
+
+    if not explicit_group_lrs:
+        mamba_params, other_params = [], []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if any(token in name for token in (".fwd.", ".bwd.", ".merge.", ".pos_scale")):
+                mamba_params.append(param)
+            else:
+                other_params.append(param)
+
+        param_groups = []
+        _append_param_group(param_groups, mamba_params, base_lr * 3.0, "mamba_new")
+        _append_param_group(param_groups, other_params, base_lr, "other")
+        return param_groups
+
+    transformer = getattr(model, "transformer", None)
+    mamba_param_ids: set[int] = set()
+    backbone_param_ids: set[int] = set()
+    mamba_params: list[torch.nn.Parameter] = []
+    backbone_params: list[torch.nn.Parameter] = []
+    misc_params: list[torch.nn.Parameter] = []
+
+    if transformer is not None and hasattr(transformer, "transformer_blocks"):
+        mamba_layers = set(getattr(transformer, "mamba_layers", []) or [])
+        for idx, block in enumerate(transformer.transformer_blocks):
+            if idx in mamba_layers:
+                mixer = getattr(block, "mixer", None)
+                if mixer is not None:
+                    for param in mixer.parameters():
+                        if param.requires_grad and id(param) not in mamba_param_ids:
+                            mamba_params.append(param)
+                            mamba_param_ids.add(id(param))
+
+            for param in block.parameters():
+                param_id = id(param)
+                if not param.requires_grad or param_id in mamba_param_ids or param_id in backbone_param_ids:
+                    continue
+                backbone_params.append(param)
+                backbone_param_ids.add(param_id)
+
+    for _, param in model.named_parameters():
+        param_id = id(param)
+        if not param.requires_grad or param_id in mamba_param_ids or param_id in backbone_param_ids:
+            continue
+        misc_params.append(param)
+
+    param_groups: list[dict] = []
+    _append_param_group(param_groups, mamba_params, default(mamba_learning_rate, base_lr * 3.0), "mamba_new")
+    _append_param_group(param_groups, backbone_params, default(backbone_learning_rate, base_lr), "shared_dit_blocks")
+    _append_param_group(param_groups, misc_params, default(misc_learning_rate, base_lr), "misc")
     return param_groups
 
 
@@ -48,7 +105,12 @@ class Trainer:
         model: CFM,
         epochs,
         learning_rate,
+        max_updates: int | None = None,
         num_warmup_updates=20000,
+        hidden_distill_ramp_fraction: float = 0.15,
+        mamba_learning_rate: float | None = None,
+        backbone_learning_rate: float | None = None,
+        misc_learning_rate: float | None = None,
         save_per_updates=1000,
         keep_last_n_checkpoints: int = -1,  # -1 to keep all, 0 to not save intermediate, > 0 to keep last N checkpoints
         checkpoint_path=None,
@@ -97,7 +159,12 @@ class Trainer:
                 model_cfg_dict = {
                     "epochs": epochs,
                     "learning_rate": learning_rate,
+                    "max_updates": max_updates,
+                    "mamba_learning_rate": mamba_learning_rate,
+                    "backbone_learning_rate": backbone_learning_rate,
+                    "misc_learning_rate": misc_learning_rate,
                     "num_warmup_updates": num_warmup_updates,
+                    "hidden_distill_ramp_fraction": hidden_distill_ramp_fraction,
                     "batch_size_per_gpu": batch_size_per_gpu,
                     "batch_size_type": batch_size_type,
                     "max_samples": max_samples,
@@ -133,7 +200,9 @@ class Trainer:
                 )
 
         self.epochs = epochs
+        self.max_updates = max_updates
         self.num_warmup_updates = num_warmup_updates
+        self.hidden_distill_ramp_fraction = hidden_distill_ramp_fraction
         self.save_per_updates = save_per_updates
         self.keep_last_n_checkpoints = keep_last_n_checkpoints
         self.last_per_updates = default(last_per_updates, save_per_updates)
@@ -154,6 +223,16 @@ class Trainer:
 
         self.duration_predictor = duration_predictor
         self.base_learning_rate = learning_rate
+        self.mamba_learning_rate = mamba_learning_rate
+        self.backbone_learning_rate = backbone_learning_rate
+        self.misc_learning_rate = misc_learning_rate
+
+        if self.max_updates is not None and self.max_updates <= 0:
+            raise ValueError(f"max_updates must be > 0 when provided, got {self.max_updates}")
+        if self.hidden_distill_ramp_fraction < 0:
+            raise ValueError(
+                f"hidden_distill_ramp_fraction must be >= 0, got {self.hidden_distill_ramp_fraction}"
+            )
 
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         if not trainable_params:
@@ -167,7 +246,13 @@ class Trainer:
         if self.is_main:
             print(f"Trainable params: {self.trainable_param_count}/{self.total_param_count}")
 
-        optimizer_param_groups = _build_param_groups(model, learning_rate)
+        optimizer_param_groups = _build_param_groups(
+            model,
+            learning_rate,
+            mamba_learning_rate=mamba_learning_rate,
+            backbone_learning_rate=backbone_learning_rate,
+            misc_learning_rate=misc_learning_rate,
+        )
         if bnb_optimizer:
             import bitsandbytes as bnb
 
@@ -195,7 +280,9 @@ class Trainer:
         cfg_msg = (
             "[Training Config Summary] "
             f"epochs={self.epochs} base_lr={self.base_learning_rate} "
-            f"lr_groups={[group['lr'] for group in self.optimizer.param_groups]} warmup_updates={self.num_warmup_updates} "
+            f"max_updates={self.max_updates} "
+            f"lr_groups={[(group.get('group_name', f'group_{idx}'), group['lr'], group.get('param_count', 'n/a')) for idx, group in enumerate(self.optimizer.param_groups)]} "
+            f"warmup_updates={self.num_warmup_updates} hidden_ramp_fraction={self.hidden_distill_ramp_fraction} "
             f"batch_size_per_gpu={self.batch_size_per_gpu} batch_size_type={self.batch_size_type} max_samples={self.max_samples} "
             f"grad_accumulation_steps={self.grad_accumulation_steps} max_grad_norm={self.max_grad_norm}"
         )
@@ -206,6 +293,8 @@ class Trainer:
             f"use_distill={bool(getattr(model, 'use_distill', False))} "
             f"lambda_distill_out={float(getattr(model, 'lambda_distill_out', 0.0)):.6f} "
             f"lambda_distill_hidden={float(getattr(model, 'lambda_distill_hidden', 0.0)):.6f} "
+            f"distill_hidden_layers={list(getattr(model, 'distill_hidden_layers', []) or [])} "
+            f"normalize_distill_hidden={bool(getattr(model, 'normalize_distill_hidden', False))} "
             f"distill_temperature={float(getattr(model, 'distill_temperature', 1.0)):.1f} "
             f"use_ctc={bool(getattr(model, 'use_ctc', False))} "
             f"lambda_ctc={float(getattr(model, 'lambda_ctc', 0.0)):.6f} "
@@ -441,8 +530,14 @@ class Trainer:
             self.num_warmup_updates * self.accelerator.num_processes
         )  # consider a fixed warmup steps while using accelerate multi-gpu ddp
         # otherwise by default with split_batches=False, warmup steps change with num_processes
-        total_updates = math.ceil(len(train_dataloader) / self.grad_accumulation_steps) * self.epochs
-        decay_updates = total_updates - warmup_updates
+        epoch_updates = math.ceil(len(train_dataloader) / self.grad_accumulation_steps)
+        computed_total_updates = epoch_updates * self.epochs
+        total_updates = self.max_updates if self.max_updates is not None else computed_total_updates
+        if total_updates <= 0:
+            raise ValueError(f"total_updates must be > 0, got {total_updates}")
+        if warmup_updates >= total_updates:
+            warmup_updates = max(total_updates - 1, 1)
+        decay_updates = max(total_updates - warmup_updates, 1)
         warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_updates)
         decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_updates)
         self.scheduler = SequentialLR(
@@ -453,6 +548,13 @@ class Trainer:
         )  # actual multi_gpu updates = single_gpu updates / gpu nums
         start_update = self.load_checkpoint()
         global_update = start_update
+        if global_update >= total_updates:
+            if self.is_main:
+                print(
+                    f"Training already reached target updates ({global_update}/{total_updates}). "
+                    "Nothing to do."
+                )
+            return
 
         cfm_model = self.accelerator.unwrap_model(self.model)
         distill_hidden_target = float(getattr(cfm_model, "lambda_distill_hidden", 0.0))
@@ -460,7 +562,7 @@ class Trainer:
         def _update_hidden_ramp(global_update: int, total_updates: int):
             if distill_hidden_target <= 0:
                 return
-            ramp_end = int(total_updates * 0.15)
+            ramp_end = int(total_updates * self.hidden_distill_ramp_fraction)
             if global_update >= ramp_end:
                 cfm_model.lambda_distill_hidden = distill_hidden_target
             else:
@@ -544,8 +646,16 @@ class Trainer:
                     progress_bar.set_postfix(update=str(global_update), loss=loss.item())
 
                 if self.accelerator.is_local_main_process:
-                    log_payload = {"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}
-                    loss_detail = getattr(self.accelerator.unwrap_model(self.model), "last_loss_dict", None)
+                    group_lrs = self.scheduler.get_last_lr()
+                    log_payload = {"loss": loss.item(), "lr": group_lrs[0]}
+                    for idx, lr in enumerate(group_lrs):
+                        group_name = self.optimizer.param_groups[idx].get("group_name", f"group_{idx}")
+                        log_payload[f"lr_{group_name}"] = lr
+                    model_unwrapped = self.accelerator.unwrap_model(self.model)
+                    log_payload["lambda_distill_hidden_current"] = float(
+                        getattr(model_unwrapped, "lambda_distill_hidden", 0.0)
+                    )
+                    loss_detail = getattr(model_unwrapped, "last_loss_dict", None)
                     if isinstance(loss_detail, dict):
                         for key, value in loss_detail.items():
                             if torch.is_tensor(value):
@@ -594,6 +704,14 @@ class Trainer:
                             f"{log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate
                         )
                         self.model.train()
+
+                if global_update >= total_updates:
+                    break
+
+            if global_update >= total_updates:
+                progress_bar.close()
+                break
+            progress_bar.close()
 
         self.save_checkpoint(global_update, last=True)
 
