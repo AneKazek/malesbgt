@@ -187,6 +187,7 @@ class DiT(nn.Module):
         attn_mask_enabled=False,
         long_skip_connection=False,
         checkpoint_activations=False,
+        capture_hidden_for_distill: bool = False,
     ):
         super().__init__()
 
@@ -230,6 +231,8 @@ class DiT(nn.Module):
         self.proj_out = nn.Linear(dim, mel_dim)
 
         self.checkpoint_activations = checkpoint_activations
+        self.capture_hidden_for_distill = bool(capture_hidden_for_distill)
+        self.last_hidden_states: list[torch.Tensor] | None = None
 
         self.initialize_weights()
 
@@ -288,6 +291,9 @@ class DiT(nn.Module):
     def clear_cache(self):
         self.text_cond, self.text_uncond = None, None
 
+    def set_capture_hidden_for_distill(self, enabled: bool) -> None:
+        self.capture_hidden_for_distill = bool(enabled)
+
     def forward(
         self,
         x: float["b n d"],  # nosied input audio
@@ -303,6 +309,10 @@ class DiT(nn.Module):
         batch, seq_len = x.shape[0], x.shape[1]
         if time.ndim == 0:
             time = time.repeat(batch)
+
+        # Guard against stale tensors from a previous forward when capture is
+        # toggled off or when the current forward exits early.
+        self.last_hidden_states = None
 
         # t: conditioning time, text: text, x: noised audio + cond audio + text
         t = self.time_embed(time)
@@ -326,6 +336,8 @@ class DiT(nn.Module):
         if self.long_skip_connection is not None:
             residual = x
 
+        hidden_states: list[torch.Tensor] | None = [] if self.capture_hidden_for_distill else None
+
         for block in self.transformer_blocks:
             if self.checkpoint_activations:
                 # https://pytorch.org/docs/stable/checkpoint.html#torch.utils.checkpoint.checkpoint
@@ -333,8 +345,13 @@ class DiT(nn.Module):
             else:
                 x = block(x, t, mask=mask, rope=rope)
 
+            if hidden_states is not None:
+                hidden_states.append(x)
+
         if self.long_skip_connection is not None:
             x = self.long_skip_connection(torch.cat((x, residual), dim=-1))
+
+        self.last_hidden_states = hidden_states
 
         x = self.norm_out(x, t)
         output = self.proj_out(x)
