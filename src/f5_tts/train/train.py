@@ -250,6 +250,8 @@ def main(model_cfg):
         learning_rate=model_cfg.optim.learning_rate,
         max_updates=model_cfg.optim.get("max_updates", None),
         num_warmup_updates=model_cfg.optim.num_warmup_updates,
+        lr_scheduler_type=model_cfg.optim.get("lr_scheduler_type", "linear"),
+        cosine_eta_min_ratio=model_cfg.optim.get("cosine_eta_min_ratio", 0.0),
         hidden_distill_ramp_fraction=model_cfg.optim.get("hidden_distill_ramp_fraction", 0.15),
         mamba_learning_rate=model_cfg.optim.get("mamba_learning_rate", None),
         backbone_learning_rate=model_cfg.optim.get("backbone_learning_rate", None),

@@ -11,7 +11,7 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 from ema_pytorch import EMA
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LinearLR, SequentialLR
+from torch.optim.lr_scheduler import LambdaLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset, SequentialSampler
 from tqdm import tqdm
 
@@ -107,6 +107,8 @@ class Trainer:
         learning_rate,
         max_updates: int | None = None,
         num_warmup_updates=20000,
+        lr_scheduler_type: str = "linear",
+        cosine_eta_min_ratio: float = 0.0,
         hidden_distill_ramp_fraction: float = 0.15,
         mamba_learning_rate: float | None = None,
         backbone_learning_rate: float | None = None,
@@ -164,6 +166,8 @@ class Trainer:
                     "backbone_learning_rate": backbone_learning_rate,
                     "misc_learning_rate": misc_learning_rate,
                     "num_warmup_updates": num_warmup_updates,
+                    "lr_scheduler_type": lr_scheduler_type,
+                    "cosine_eta_min_ratio": cosine_eta_min_ratio,
                     "hidden_distill_ramp_fraction": hidden_distill_ramp_fraction,
                     "batch_size_per_gpu": batch_size_per_gpu,
                     "batch_size_type": batch_size_type,
@@ -202,6 +206,8 @@ class Trainer:
         self.epochs = epochs
         self.max_updates = max_updates
         self.num_warmup_updates = num_warmup_updates
+        self.lr_scheduler_type = str(lr_scheduler_type).strip().lower()
+        self.cosine_eta_min_ratio = float(cosine_eta_min_ratio)
         self.hidden_distill_ramp_fraction = hidden_distill_ramp_fraction
         self.save_per_updates = save_per_updates
         self.keep_last_n_checkpoints = keep_last_n_checkpoints
@@ -229,6 +235,14 @@ class Trainer:
 
         if self.max_updates is not None and self.max_updates <= 0:
             raise ValueError(f"max_updates must be > 0 when provided, got {self.max_updates}")
+        if self.lr_scheduler_type not in {"linear", "cosine"}:
+            raise ValueError(
+                f"lr_scheduler_type must be one of ['linear', 'cosine'], got {self.lr_scheduler_type!r}"
+            )
+        if not 0.0 <= self.cosine_eta_min_ratio <= 1.0:
+            raise ValueError(
+                f"cosine_eta_min_ratio must be within [0, 1], got {self.cosine_eta_min_ratio}"
+            )
         if self.hidden_distill_ramp_fraction < 0:
             raise ValueError(
                 f"hidden_distill_ramp_fraction must be >= 0, got {self.hidden_distill_ramp_fraction}"
@@ -282,7 +296,8 @@ class Trainer:
             f"epochs={self.epochs} base_lr={self.base_learning_rate} "
             f"max_updates={self.max_updates} "
             f"lr_groups={[(group.get('group_name', f'group_{idx}'), group['lr'], group.get('param_count', 'n/a')) for idx, group in enumerate(self.optimizer.param_groups)]} "
-            f"warmup_updates={self.num_warmup_updates} hidden_ramp_fraction={self.hidden_distill_ramp_fraction} "
+            f"warmup_updates={self.num_warmup_updates} lr_scheduler_type={self.lr_scheduler_type} "
+            f"cosine_eta_min_ratio={self.cosine_eta_min_ratio} hidden_ramp_fraction={self.hidden_distill_ramp_fraction} "
             f"batch_size_per_gpu={self.batch_size_per_gpu} batch_size_type={self.batch_size_type} max_samples={self.max_samples} "
             f"grad_accumulation_steps={self.grad_accumulation_steps} max_grad_norm={self.max_grad_norm}"
         )
@@ -539,7 +554,17 @@ class Trainer:
             warmup_updates = max(total_updates - 1, 1)
         decay_updates = max(total_updates - warmup_updates, 1)
         warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_updates)
-        decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_updates)
+        if self.lr_scheduler_type == "cosine":
+            eta_min_ratio = self.cosine_eta_min_ratio
+
+            def _cosine_decay_lambda(step: int) -> float:
+                progress = min(max(step, 0), decay_updates) / max(decay_updates, 1)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return eta_min_ratio + (1.0 - eta_min_ratio) * cosine
+
+            decay_scheduler = LambdaLR(self.optimizer, lr_lambda=_cosine_decay_lambda)
+        else:
+            decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_updates)
         self.scheduler = SequentialLR(
             self.optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_updates]
         )
