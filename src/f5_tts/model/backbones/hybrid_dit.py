@@ -54,11 +54,7 @@ class HybridDiTBlock(nn.Module):
     The AdaLayerNorm + FeedForward path is identical to DiTBlock so pretrained
     FFN / AdaLN weights can be copied across during _replace_selected_layers().
 
-    Parameters
-    ----------
-    use_bidi      : use BidirectionalMambaSubBlock (True) or legacy causal (False)
-    inject_sinpos : inject sinusoidal positional bias before each SSM scan
-                    (only active when use_bidi=True)
+    V2: Added learnable mamba_alpha (zero-init) to ensure stable warm-start.
     """
 
     def __init__(
@@ -88,6 +84,9 @@ class HybridDiTBlock(nn.Module):
             inject_sinpos=inject_sinpos if use_bidi else False,
         )
 
+        # --- Stability gate (zero-init for warm-start) ---
+        self.mamba_alpha = nn.Parameter(torch.zeros(1))
+
         # --- Feed-forward (identical to DiTBlock) ---
         self.ff_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff = FeedForward(dim=dim, mult=ff_mult, dropout=dropout, approximate="tanh")
@@ -99,17 +98,14 @@ class HybridDiTBlock(nn.Module):
         mask: torch.Tensor | None = None,  # (B, T) bool
         rope=None,                 # passed from HybridDiT.forward, not used here
     ) -> torch.Tensor:
-        # rope is generated for the full stack by DiT's RotaryEmbedding and
-        # forwarded to every block uniformly.  DiTBlocks use it; Mamba blocks
-        # ignore it (Mamba gets positional info via inject_sinpos instead).
-        _ = rope  # explicit no-op — do NOT del, keep it readable
+        _ = rope  # explicit no-op
 
         # AdaLN modulation
         norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, emb=t)
 
-        # Mamba mixer (bidi or causal)
+        # Mamba mixer with learnable zero-init alpha gate
         mix_out = self.mixer(norm, mask=mask)
-        x = x + gate_msa.unsqueeze(1) * mix_out
+        x = x + self.mamba_alpha * gate_msa.unsqueeze(1) * mix_out
 
         # Feed-forward
         norm = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
@@ -128,18 +124,11 @@ class HybridDiT(DiT):
     F5-TTS backbone: early layers are BidirectionalMambaSubBlock,
     late layers are standard DiTBlock (full self-attention + RoPE).
 
-    All DiT kwargs are forwarded to the parent constructor so configs are
-    backward-compatible.  Mamba-specific kwargs are consumed here.
-
     Key parameters
     --------------
     mamba_layers     : list[int] of layer indices to swap → Mamba.
-                       Recommended: [0,1,2,3,4,5,6,7]  (early 8 of 22)
+                       Default: [6, 10, 14, 18] (Sparse placement)
     use_bidi         : bidirectional Mamba (True) or legacy causal (False).
-                       MUST be True for non-autoregressive TTS.
-    inject_sinpos    : inject sinusoidal positional bias in Mamba blocks.
-    mamba_d_state    : SSM state size.  64 recommended (↑ from legacy 16).
-    capture_hidden_for_distill : collect hidden states for distillation loss.
     """
 
     def __init__(
@@ -161,7 +150,7 @@ class HybridDiT(DiT):
         # Store Mamba params before super().__init__ builds transformer_blocks
         self._ff_mult = int(kwargs.get("ff_mult", 4))
         self.use_mamba = bool(use_mamba)
-        self.mamba_layers = sorted(set(mamba_layers or []))
+        self.mamba_layers = sorted(set(mamba_layers if mamba_layers is not None else [6, 10, 14, 18]))
         self.use_bidi = bool(use_bidi)
         self.inject_sinpos = bool(inject_sinpos)
         self.mamba_d_state = int(mamba_d_state)
@@ -183,22 +172,15 @@ class HybridDiT(DiT):
     def _replace_selected_layers_with_mamba(self) -> None:
         """
         Swap selected DiTBlocks → HybridDiTBlocks in-place.
-
-        Weight transfer strategy:
-          AdaLN   → copied from base block  (keeps timestep-conditioning intact)
-          FFN     → copied from base block  (keeps learned transformations)
-          ff_norm → copied from base block
-          mixer   → freshly initialised     (only the SSM is new)
-
-        This means the model is a valid continuation of any pretrained DiT
-        checkpoint with ~(mamba_layers count / depth) fraction of new weights.
         """
         depth = len(self.transformer_blocks)
         valid = [i for i in self.mamba_layers if 0 <= i < depth]
 
         for idx in valid:
             base = self.transformer_blocks[idx]
-            dropout = float(getattr(base.attn.to_out[1], "p", 0.0))
+            dropout = 0.0
+            if hasattr(base, "attn") and hasattr(base.attn, "to_out"):
+                dropout = float(getattr(base.attn.to_out[1], "p", 0.0))
 
             hybrid = HybridDiTBlock(
                 dim=self.dim,
@@ -211,7 +193,7 @@ class HybridDiT(DiT):
                 inject_sinpos=self.inject_sinpos,
             )
 
-            # Copy AdaLN, ff_norm, FFN weights — only mixer is initialised fresh
+            # Copy AdaLN, ff_norm, FFN weights — only mixer + mamba_alpha are new
             hybrid.attn_norm.load_state_dict(base.attn_norm.state_dict())
             hybrid.ff_norm.load_state_dict(base.ff_norm.state_dict())
             hybrid.ff.load_state_dict(base.ff.state_dict())
