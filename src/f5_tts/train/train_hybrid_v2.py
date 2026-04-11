@@ -15,12 +15,18 @@ def print_banner(text):
 
 def setup_teacher(model_cfg, vocab_size, mel_dim):
     """Initialize and load the pretrained DiT teacher."""
+    import inspect
     teacher_cfg = model_cfg.model.get("teacher_arch", model_cfg.model.arch)
+    teacher_cfg = dict(teacher_cfg)  # Convert OmegaConf DictConfig to dict for filtering
     teacher_backbone = model_cfg.model.get("teacher_backbone", "DiT")
     teacher_cls = hydra.utils.get_class(f"f5_tts.model.backbones.{teacher_backbone.lower()}.{teacher_backbone}")
     
+    # Filter kwargs dynamically to avoid "unexpected keyword argument" when fallback to model.arch
+    valid_args = inspect.signature(teacher_cls.__init__).parameters
+    teacher_kwargs = {k: v for k, v in teacher_cfg.items() if k in valid_args}
+    
     teacher = teacher_cls(
-        **teacher_cfg,
+        **teacher_kwargs,
         text_num_embeds=vocab_size,
         mel_dim=mel_dim
     )
@@ -77,14 +83,20 @@ def train(cfg: DictConfig):
     print(f"Warm-started student with {num_copied} tensors from teacher.")
     
     # 4. Wrap with CFM
-    cfm_experiment = OmegaConf.to_container(cfg.model.cfm_experiment, resolve=True)
-    cfm_experiment["teacher_transformer"] = teacher
+    cfm_experiment_full = OmegaConf.to_container(cfg.model.cfm_experiment, resolve=True)
+    
+    # Filter only expected kwargs for CFM
+    import inspect
+    valid_cfm_args = inspect.signature(CFM.__init__).parameters
+    cfm_kwargs = {k: v for k, v in cfm_experiment_full.items() if k in valid_cfm_args}
+    
+    cfm_kwargs["teacher_transformer"] = teacher
     
     model = CFM(
         transformer=student_transformer,
-        mel_spec_kwargs=cfg.model.mel_spec,
+        mel_spec_kwargs=OmegaConf.to_container(cfg.model.mel_spec, resolve=True) if hasattr(cfg.model, "mel_spec") else dict(),
         vocab_char_map=vocab_char_map,
-        **cfm_experiment
+        **cfm_kwargs
     )
     
     # 5. Dataset & Trainer
